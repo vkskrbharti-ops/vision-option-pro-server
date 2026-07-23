@@ -24,17 +24,38 @@ app.use(cors());
 let nseCookies = '';
 let lastCookieFetch = 0;
 
-const BROWSER_HEADERS = {
+const BASE_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-  'Accept': 'application/json, text/plain, */*',
   'Accept-Language': 'en-US,en;q=0.9',
   'Accept-Encoding': 'gzip, deflate, br',
+  'sec-ch-ua': '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"',
+};
+
+const NAV_HEADERS = {
+  ...BASE_HEADERS,
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+  'sec-fetch-dest': 'document',
+  'sec-fetch-mode': 'navigate',
+  'sec-fetch-site': 'none',
+  'sec-fetch-user': '?1',
+  'Upgrade-Insecure-Requests': '1',
+};
+
+const XHR_HEADERS = {
+  ...BASE_HEADERS,
+  'Accept': '*/*',
   'Referer': 'https://www.nseindia.com/option-chain',
+  'sec-fetch-dest': 'empty',
+  'sec-fetch-mode': 'cors',
+  'sec-fetch-site': 'same-origin',
+  'X-Requested-With': 'XMLHttpRequest',
 };
 
 async function refreshCookies() {
   const res = await axios.get('https://www.nseindia.com/option-chain', {
-    headers: BROWSER_HEADERS,
+    headers: NAV_HEADERS,
     timeout: 10000,
   });
   const setCookie = res.headers['set-cookie'] || [];
@@ -51,8 +72,9 @@ app.get('/api/option-chain', async (req, res) => {
     if (!nseCookies || Date.now() - lastCookieFetch > 4 * 60 * 1000) {
       await refreshCookies();
     }
+    console.log('DEBUG cookies length:', nseCookies.length);
 
-    const headers = { ...BROWSER_HEADERS, Cookie: nseCookies };
+    const headers = { ...XHR_HEADERS, Cookie: nseCookies };
 
     const firstCall = await axios.get(
       `https://www.nseindia.com/api/option-chain-v3?type=${type}&symbol=${symbol}`,
