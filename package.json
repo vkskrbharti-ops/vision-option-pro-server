@@ -1,7 +1,7 @@
 {
   "name": "vision-option-pro-server",
-  "version": "1.0.0",
-  "description": "Local proxy server to fetch live NSE option chain data for Vision Option Pro dashboard",
+  "version": "2.0.0",
+  "description": "Kotak Neo Trade API live data server for Vision Option Pro dashboard",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -9,6 +9,7 @@
   "dependencies": {
     "express": "^4.19.2",
     "cors": "^2.8.5",
-    "axios": "^1.7.2"
+    "axios": "^1.7.2",
+    "otplib": "^12.0.1"
   }
 }
