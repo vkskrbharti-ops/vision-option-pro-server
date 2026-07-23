@@ -27,7 +27,7 @@ async function login() {
   const accessToken = process.env.KOTAK_ACCESS_TOKEN;
   const mobile = process.env.KOTAK_MOBILE;
   const ucc = process.env.KOTAK_UCC;
-  const totpSecret = process.env.KOTAK_TOTP_SECRET;
+  const totpSecret = (process.env.KOTAK_TOTP_SECRET || '').replace(/\s+/g, '').toUpperCase();
   const mpin = process.env.KOTAK_MPIN;
 
   if (!accessToken || !mobile || !ucc || !totpSecret || !mpin) {
@@ -35,7 +35,8 @@ async function login() {
   }
 
   const totp = authenticator.generate(totpSecret);
-  console.log('DEBUG generated TOTP (do not reuse, expires in 30s)');
+  console.log('DEBUG totpSecret length:', totpSecret.length);
+  console.log('DEBUG generated TOTP:', totp);
 
   // Step 1: tradeApiLogin
   const loginRes = await axios.post(
