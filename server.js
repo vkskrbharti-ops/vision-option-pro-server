@@ -1,6 +1,16 @@
 // Vision Option Pro — Live Data Proxy Server
 // Isko apne computer par chalao taaki NSE ka option chain data
 // browser ke CORS/bot-protection ko bypass karke fetch ho sake.
+//
+// Setup:
+//   1) Node.js install karo (nodejs.org) agar pehle se nahi hai
+//   2) Is folder me terminal khol ke: npm install
+//   3) Phir chalao: node server.js
+//   4) Browser me dashboard kholo — woh http://localhost:5000 se live data lega
+//
+// NOTE: NSE apna anti-bot protection samay-samay par change karta rehta hai.
+// Agar yeh kabhi 401/403 error de, to NSE ne unka protection update kiya hai —
+// tab headers/cookie-refresh logic update karni padegi.
 
 const express = require('express');
 const cors = require('cors');
@@ -15,9 +25,10 @@ let nseCookies = '';
 let lastCookieFetch = 0;
 
 const BROWSER_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
   'Accept': 'application/json, text/plain, */*',
   'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'gzip, deflate, br',
   'Referer': 'https://www.nseindia.com/option-chain',
 };
 
@@ -34,28 +45,31 @@ async function refreshCookies() {
 app.get('/api/option-chain', async (req, res) => {
   const symbol = (req.query.symbol || 'NIFTY').toUpperCase();
   const isIndex = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'].includes(symbol);
-  const endpoint = isIndex
-    ? `https://www.nseindia.com/api/option-chain-indices?symbol=${symbol}`
-    : `https://www.nseindia.com/api/option-chain-equities?symbol=${symbol}`;
+  const type = isIndex ? 'Indices' : 'Equity';
 
   try {
     if (!nseCookies || Date.now() - lastCookieFetch > 4 * 60 * 1000) {
       await refreshCookies();
     }
 
-    const response = await axios.get(endpoint, {
-      headers: { ...BROWSER_HEADERS, Cookie: nseCookies },
-      timeout: 10000,
-    });
+    const headers = { ...BROWSER_HEADERS, Cookie: nseCookies };
 
-    const data = response.data;
-    const records = data.records;
+    const firstCall = await axios.get(
+      `https://www.nseindia.com/api/option-chain-v3?type=${type}&symbol=${symbol}`,
+      { headers, timeout: 10000 }
+    );
+    const records = firstCall.data.records;
     const spot = records.underlyingValue;
     const expiryDates = records.expiryDates;
     const nearestExpiry = expiryDates[0];
 
-    const rows = records.data
-      .filter(r => r.expiryDate === nearestExpiry)
+    const secondCall = await axios.get(
+      `https://www.nseindia.com/api/option-chain-v3?type=${type}&symbol=${symbol}&expiry=${nearestExpiry}`,
+      { headers, timeout: 10000 }
+    );
+    const records2 = secondCall.data.records;
+
+    const rows = records2.data
       .map(r => ({
         strike: r.strikePrice,
         callOI: r.CE ? r.CE.openInterest : 0,
