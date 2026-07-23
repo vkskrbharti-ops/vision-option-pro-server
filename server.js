@@ -58,6 +58,8 @@ app.get('/api/option-chain', async (req, res) => {
       `https://www.nseindia.com/api/option-chain-v3?type=${type}&symbol=${symbol}`,
       { headers, timeout: 10000 }
     );
+    console.log('DEBUG firstCall status:', firstCall.status);
+    console.log('DEBUG firstCall data (first 500 chars):', JSON.stringify(firstCall.data).slice(0, 500));
     const records = firstCall.data.records;
     const spot = records.underlyingValue;
     const expiryDates = records.expiryDates;
