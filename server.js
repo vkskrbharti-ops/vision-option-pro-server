@@ -24,9 +24,9 @@ const LOGIN_BASE = 'https://mis.kotaksecurities.com';
 let session = null; // { token, sid, baseUrl, expiresAt }
 
 async function login() {
-  const accessToken = process.env.KOTAK_ACCESS_TOKEN;
-  const mobile = process.env.KOTAK_MOBILE;
-  const ucc = process.env.KOTAK_UCC;
+  const accessToken = (process.env.KOTAK_ACCESS_TOKEN || '').trim();
+  const mobile = (process.env.KOTAK_MOBILE || '').trim();
+  const ucc = (process.env.KOTAK_UCC || '').trim().toUpperCase();
   const totpSecret = (process.env.KOTAK_TOTP_SECRET || '').replace(/\s+/g, '').toUpperCase();
   const mpin = process.env.KOTAK_MPIN;
 
@@ -37,6 +37,8 @@ async function login() {
   const totp = authenticator.generate(totpSecret);
   console.log('DEBUG totpSecret length:', totpSecret.length);
   console.log('DEBUG generated TOTP:', totp);
+  console.log('DEBUG mobile length:', mobile.length, 'last4:', mobile.slice(-4));
+  console.log('DEBUG ucc length:', ucc.length, 'first:', ucc[0], 'last:', ucc[ucc.length-1]);
 
   // Step 1: tradeApiLogin
   const loginRes = await axios.post(
