@@ -1,131 +1,139 @@
-// Vision Option Pro — Live Data Proxy Server
-// Isko apne computer par chalao taaki NSE ka option chain data
-// browser ke CORS/bot-protection ko bypass karke fetch ho sake.
+// Vision Option Pro — Kotak Neo Trade API Live Data Server
 //
-// Setup:
-//   1) Node.js install karo (nodejs.org) agar pehle se nahi hai
-//   2) Is folder me terminal khol ke: npm install
-//   3) Phir chalao: node server.js
-//   4) Browser me dashboard kholo — woh http://localhost:5000 se live data lega
+// Uses official Kotak Neo Trade API (not NSE scraping) for reliable live data.
+// Credentials come from environment variables set in Render's Environment tab:
+//   KOTAK_ACCESS_TOKEN, KOTAK_MOBILE, KOTAK_UCC, KOTAK_TOTP_SECRET, KOTAK_MPIN
 //
-// NOTE: NSE apna anti-bot protection samay-samay par change karta rehta hai.
-// Agar yeh kabhi 401/403 error de, to NSE ne unka protection update kiya hai —
-// tab headers/cookie-refresh logic update karni padegi.
+// Flow:
+//   1) Generate a fresh 6-digit TOTP from KOTAK_TOTP_SECRET
+//   2) POST /login/1.0/tradeApiLogin (mobileNumber, ucc, totp) -> viewToken, viewSid
+//   3) POST /login/1.0/tradeApiValidate (mpin) -> sessionToken, sessionSid, baseUrl
+//   4) Use baseUrl + sessionToken/sessionSid for all further calls (quotes, scripmaster)
 
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const { authenticator } = require('otplib');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-
 app.use(cors());
 
-let nseCookies = '';
-let lastCookieFetch = 0;
+const LOGIN_BASE = 'https://mis.kotaksecurities.com';
 
-const BASE_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-  'Accept-Language': 'en-US,en;q=0.9',
-  'Accept-Encoding': 'gzip, deflate, br',
-  'sec-ch-ua': '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
-  'sec-ch-ua-mobile': '?0',
-  'sec-ch-ua-platform': '"Windows"',
-};
+let session = null; // { token, sid, baseUrl, expiresAt }
 
-const NAV_HEADERS = {
-  ...BASE_HEADERS,
-  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-  'sec-fetch-dest': 'document',
-  'sec-fetch-mode': 'navigate',
-  'sec-fetch-site': 'none',
-  'sec-fetch-user': '?1',
-  'Upgrade-Insecure-Requests': '1',
-};
+async function login() {
+  const accessToken = process.env.KOTAK_ACCESS_TOKEN;
+  const mobile = process.env.KOTAK_MOBILE;
+  const ucc = process.env.KOTAK_UCC;
+  const totpSecret = process.env.KOTAK_TOTP_SECRET;
+  const mpin = process.env.KOTAK_MPIN;
 
-const XHR_HEADERS = {
-  ...BASE_HEADERS,
-  'Accept': '*/*',
-  'Referer': 'https://www.nseindia.com/option-chain',
-  'sec-fetch-dest': 'empty',
-  'sec-fetch-mode': 'cors',
-  'sec-fetch-site': 'same-origin',
-  'X-Requested-With': 'XMLHttpRequest',
-};
+  if (!accessToken || !mobile || !ucc || !totpSecret || !mpin) {
+    throw new Error('Missing one or more KOTAK_* environment variables');
+  }
 
-async function refreshCookies() {
-  const res = await axios.get('https://www.nseindia.com/option-chain', {
-    headers: NAV_HEADERS,
-    timeout: 10000,
-  });
-  const setCookie = res.headers['set-cookie'] || [];
-  nseCookies = setCookie.map(c => c.split(';')[0]).join('; ');
-  lastCookieFetch = Date.now();
+  const totp = authenticator.generate(totpSecret);
+  console.log('DEBUG generated TOTP (do not reuse, expires in 30s)');
+
+  // Step 1: tradeApiLogin
+  const loginRes = await axios.post(
+    `${LOGIN_BASE}/login/1.0/tradeApiLogin`,
+    { mobileNumber: mobile, ucc, totp },
+    {
+      headers: {
+        Authorization: accessToken,
+        'neo-fin-key': 'neotradeapi',
+        'Content-Type': 'application/json',
+      },
+      timeout: 10000,
+    }
+  );
+  console.log('DEBUG tradeApiLogin status:', loginRes.status);
+  const viewToken = loginRes.data.data.token;
+  const viewSid = loginRes.data.data.sid;
+
+  // Step 2: tradeApiValidate
+  const validateRes = await axios.post(
+    `${LOGIN_BASE}/login/1.0/tradeApiValidate`,
+    { mpin },
+    {
+      headers: {
+        Authorization: accessToken,
+        'neo-fin-key': 'neotradeapi',
+        sid: viewSid,
+        Auth: viewToken,
+        'Content-Type': 'application/json',
+      },
+      timeout: 10000,
+    }
+  );
+  console.log('DEBUG tradeApiValidate status:', validateRes.status);
+  const sessionToken = validateRes.data.data.token;
+  const sessionSid = validateRes.data.data.sid;
+  const baseUrl = validateRes.data.data.baseUrl;
+  console.log('DEBUG baseUrl:', baseUrl);
+
+  session = {
+    token: sessionToken,
+    sid: sessionSid,
+    baseUrl,
+    accessToken,
+    expiresAt: Date.now() + 6 * 60 * 60 * 1000, // assume ~6hr validity, refresh if 401
+  };
+  return session;
 }
 
-app.get('/api/option-chain', async (req, res) => {
-  const symbol = (req.query.symbol || 'NIFTY').toUpperCase();
-  const isIndex = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'].includes(symbol);
-  const type = isIndex ? 'Indices' : 'Equity';
+async function ensureSession() {
+  if (!session || Date.now() > session.expiresAt) {
+    await login();
+  }
+  return session;
+}
 
+function authHeaders(s) {
+  return {
+    Authorization: s.accessToken,
+    'neo-fin-key': 'neotradeapi',
+    Auth: s.token,
+    Sid: s.sid,
+  };
+}
+
+// TEST ENDPOINT: verifies login + fetches NIFTY spot quote + shows scripmaster file-paths structure
+app.get('/api/test', async (req, res) => {
   try {
-    if (!nseCookies || Date.now() - lastCookieFetch > 4 * 60 * 1000) {
-      await refreshCookies();
-    }
-    console.log('DEBUG cookies length:', nseCookies.length);
+    const s = await ensureSession();
 
-    const headers = { ...XHR_HEADERS, Cookie: nseCookies };
-
-    const firstCall = await axios.get(
-      `https://www.nseindia.com/api/option-chain-v3?type=${type}&symbol=${symbol}`,
-      { headers, timeout: 10000 }
+    // Fetch spot quote for Nifty 50 index
+    const quoteRes = await axios.get(
+      `${s.baseUrl}/script-details/1.0/quotes/neosymbol/nse_cm|Nifty 50`,
+      { headers: authHeaders(s), timeout: 10000 }
     );
-    console.log('DEBUG firstCall status:', firstCall.status);
-    console.log('DEBUG firstCall data (first 500 chars):', JSON.stringify(firstCall.data).slice(0, 500));
-    const records = firstCall.data.records;
-    const spot = records.underlyingValue;
-    const expiryDates = records.expiryDates;
-    const nearestExpiry = expiryDates[0];
+    console.log('DEBUG quote response:', JSON.stringify(quoteRes.data).slice(0, 800));
 
-    const secondCall = await axios.get(
-      `https://www.nseindia.com/api/option-chain-v3?type=${type}&symbol=${symbol}&expiry=${nearestExpiry}`,
-      { headers, timeout: 10000 }
+    // Fetch scripmaster file paths (to inspect structure)
+    const scripRes = await axios.get(
+      `${s.baseUrl}/script-details/1.0/masterscrip/file-paths`,
+      { headers: { Authorization: s.accessToken }, timeout: 10000 }
     );
-    const records2 = secondCall.data.records;
-
-    const rows = records2.data
-      .map(r => ({
-        strike: r.strikePrice,
-        callOI: r.CE ? r.CE.openInterest : 0,
-        callOIChange: r.CE ? r.CE.changeinOpenInterest : 0,
-        callVol: r.CE ? r.CE.totalTradedVolume : 0,
-        callLTP: r.CE ? r.CE.lastPrice : 0,
-        callIV: r.CE ? r.CE.impliedVolatility : 0,
-        putOI: r.PE ? r.PE.openInterest : 0,
-        putOIChange: r.PE ? r.PE.changeinOpenInterest : 0,
-        putVol: r.PE ? r.PE.totalTradedVolume : 0,
-        putLTP: r.PE ? r.PE.lastPrice : 0,
-        putIV: r.PE ? r.PE.impliedVolatility : 0,
-      }))
-      .sort((a, b) => a.strike - b.strike);
+    console.log('DEBUG scripmaster file-paths:', JSON.stringify(scripRes.data).slice(0, 800));
 
     res.json({
-      symbol,
-      spot,
-      expiry: nearestExpiry,
-      timestamp: new Date().toISOString(),
-      rows,
+      status: 'login successful',
+      quote: quoteRes.data,
+      scripmaster_paths: scripRes.data,
     });
   } catch (err) {
-    console.error('NSE fetch failed:', err.message);
+    console.error('Kotak API test failed:', err.response ? JSON.stringify(err.response.data) : err.message);
     res.status(502).json({
-      error: 'Failed to fetch live data from NSE. It may be rate-limiting or has changed its protection — try again in a few seconds.',
-      detail: err.message,
+      error: 'Kotak API call failed',
+      detail: err.response ? err.response.data : err.message,
     });
   }
 });
 
 app.listen(PORT, () => {
-  console.log(`Vision Option Pro live-data server running: http://localhost:${PORT}`);
-  console.log(`Try it: http://localhost:${PORT}/api/option-chain?symbol=NIFTY`);
+  console.log(`Vision Option Pro (Kotak Neo) server running on port ${PORT}`);
 });
