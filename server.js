@@ -107,37 +107,78 @@ async function fetchQuotes(s, tokensByExchange) {
   return res.data;
 }
 
+// Map instrument type (frontend) -> Angel One exch_seg + option instrumenttype + spot exch_seg
+function getSegmentConfig(type){
+  if(type === 'MCX') return { optSeg: 'MCX', optInstType: 'OPTFUT', spotSeg: 'MCX' };
+  if(type === 'STOCK') return { optSeg: 'NFO', optInstType: 'OPTSTK', spotSeg: 'NSE' };
+  return { optSeg: 'NFO', optInstType: 'OPTIDX', spotSeg: 'NSE' }; // INDEX default
+}
+
+function findSpotToken(instruments, symbol, type, cfg){
+  if(type === 'MCX'){
+    // For MCX, use the nearest-expiry futures contract as the reference price (no separate spot index)
+    const futs = instruments.filter(i => i.name === symbol && i.exch_seg === 'MCX' && i.instrumenttype === 'FUTCOM');
+    if(futs.length === 0) return null;
+    const today = new Date();
+    const sorted = futs.map(f => ({...f, expDate: parseExpiry(f.expiry)})).filter(f=>f.expDate>=today).sort((a,b)=>a.expDate-b.expDate);
+    return sorted[0] ? sorted[0].token : null;
+  }
+  if(type === 'STOCK'){
+    const eq = instruments.find(i => i.exch_seg === 'NSE' && i.symbol === `${symbol}-EQ`);
+    return eq ? eq.token : null;
+  }
+  // INDEX: match common name variants
+  const idx = instruments.find(i => i.exch_seg === 'NSE' &&
+    (i.symbol || '').replace(/\s+/g,'').toUpperCase() === symbol.toUpperCase());
+  return idx ? idx.token : null;
+}
+
 app.get('/api/option-chain', async (req, res) => {
   try {
-    const range = parseInt(req.query.range) || 5; // strikes above/below ATM
+    const range = parseInt(req.query.range) || 5;
+    const symbol = (req.query.symbol || 'NIFTY').toUpperCase();
+    const type = (req.query.type || 'INDEX').toUpperCase();
+    const cfg = getSegmentConfig(type);
+
     const s = await ensureSession();
     const instruments = await getInstrumentMaster();
 
-    // 1. Get spot price
-    const spotRes = await fetchQuotes(s, { NSE: [NIFTY_SPOT_TOKEN] });
-    console.log('DEBUG spotRes:', JSON.stringify(spotRes).slice(0, 500));
-    const spotData = spotRes.data.fetched.find((f) => f.symbolToken === NIFTY_SPOT_TOKEN);
+    // 1. Get spot/reference price
+    const spotToken = findSpotToken(instruments, symbol, type, cfg);
+    if(!spotToken){
+      return res.status(404).json({ error: `Could not find instrument for ${symbol} (${type}) in instrument master` });
+    }
+    const spotRes = await fetchQuotes(s, { [cfg.spotSeg]: [spotToken] });
+    const spotData = spotRes.data.fetched.find((f) => f.symbolToken === spotToken);
     const spot = spotData ? spotData.ltp : null;
 
     if (!spot) {
-      return res.status(502).json({ error: 'Could not fetch NIFTY spot price', detail: spotRes });
+      return res.status(502).json({ error: 'Could not fetch spot/reference price', detail: spotRes });
     }
 
-    // 2. Find NIFTY option contracts, nearest expiry
-    const allNiftyOptions = instruments.filter(
-      (i) => i.name === 'NIFTY' && i.exch_seg === 'NFO' && i.instrumenttype === 'OPTIDX'
+    // 2. Find option contracts for this symbol, nearest expiry
+    const allOptions = instruments.filter(
+      (i) => i.name === symbol && i.exch_seg === cfg.optSeg && i.instrumenttype === cfg.optInstType
     );
+    if(allOptions.length === 0){
+      return res.status(404).json({ error: `No option contracts found for ${symbol} (${type})` });
+    }
     const today = new Date();
-    const expiries = [...new Set(allNiftyOptions.map((o) => o.expiry))]
+    const expiries = [...new Set(allOptions.map((o) => o.expiry))]
       .map((e) => ({ str: e, date: parseExpiry(e) }))
       .filter((e) => e.date >= today)
       .sort((a, b) => a.date - b.date);
     const nearestExpiry = expiries[0].str;
 
-    const contractsThisExpiry = allNiftyOptions.filter((o) => o.expiry === nearestExpiry);
+    const contractsThisExpiry = allOptions.filter((o) => o.expiry === nearestExpiry);
 
-    // 3. Determine ATM and strike range
-    const step = 50;
+    // 3. Determine ATM and strike range (step auto-detected from listed strikes' spacing)
+    const uniqueStrikes = [...new Set(contractsThisExpiry.map(c => parseFloat(c.strike)/100))].sort((a,b)=>a-b);
+    let step = 50;
+    if(uniqueStrikes.length > 1){
+      const diffs = uniqueStrikes.slice(1).map((v,i)=>v-uniqueStrikes[i]);
+      step = Math.min(...diffs);
+    }
     const atm = Math.round(spot / step) * step;
     const wantedStrikes = [];
     for (let i = -range; i <= range; i++) wantedStrikes.push(atm + i * step);
@@ -148,12 +189,11 @@ app.get('/api/option-chain', async (req, res) => {
     });
 
     const tokens = relevantContracts.map((c) => c.token);
-    // Angel One quote API allows max ~50 tokens per call typically; chunk if needed
     const chunkSize = 50;
     let allFetched = [];
     for (let i = 0; i < tokens.length; i += chunkSize) {
       const chunk = tokens.slice(i, i + chunkSize);
-      const qRes = await fetchQuotes(s, { NFO: chunk });
+      const qRes = await fetchQuotes(s, { [cfg.optSeg]: chunk });
       if (qRes.data && qRes.data.fetched) allFetched = allFetched.concat(qRes.data.fetched);
     }
 
@@ -178,10 +218,12 @@ app.get('/api/option-chain', async (req, res) => {
     });
 
     res.json({
-      symbol: 'NIFTY',
+      symbol,
+      type,
       spot,
       expiry: nearestExpiry,
       atm,
+      step,
       timestamp: new Date().toISOString(),
       rows,
     });
