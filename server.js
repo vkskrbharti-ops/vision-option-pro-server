@@ -2,12 +2,6 @@
 //
 // Credentials from Render Environment tab:
 //   ANGEL_CLIENT_CODE, ANGEL_MPIN, ANGEL_API_KEY, ANGEL_TOTP_SECRET
-//
-// Flow:
-//   1) Generate TOTP from ANGEL_TOTP_SECRET
-//   2) POST /rest/auth/angelbroking/user/v1/loginByPassword -> jwtToken, feedToken
-//   3) Fetch public Instrument Master JSON (no auth) to find NIFTY option tokens
-//   4) POST /rest/secure/angelbroking/market/v1/quote/ -> LTP, OI, Volume for those tokens
 
 const express = require('express');
 const cors = require('cors');
@@ -20,9 +14,10 @@ app.use(cors());
 
 const API_BASE = 'https://apiconnect.angelbroking.com';
 const INSTRUMENT_MASTER_URL = 'https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json';
+const NIFTY_SPOT_TOKEN = '99926000';
 
-let session = null; // { jwtToken, feedToken, expiresAt }
-let instrumentCache = null; // { data, fetchedAt }
+let session = null;
+let instrumentCache = null;
 
 function commonHeaders(apiKey) {
   return {
@@ -48,28 +43,23 @@ async function login() {
   }
 
   const totp = authenticator.generate(totpSecret);
-  console.log('DEBUG clientcode:', clientcode, 'totpSecret length:', totpSecret.length, 'generated TOTP:', totp);
 
   const loginRes = await axios.post(
     `${API_BASE}/rest/auth/angelbroking/user/v1/loginByPassword`,
     { clientcode, password: mpin, totp },
     { headers: commonHeaders(apiKey), timeout: 10000 }
   );
-  console.log('DEBUG login response status:', loginRes.data.status, 'message:', loginRes.data.message);
 
   if (!loginRes.data.status) {
     throw new Error('Login failed: ' + JSON.stringify(loginRes.data));
   }
 
-  const jwtToken = loginRes.data.data.jwtToken;
-  const feedToken = loginRes.data.data.feedToken;
-
   session = {
-    jwtToken,
-    feedToken,
+    jwtToken: loginRes.data.data.jwtToken,
+    feedToken: loginRes.data.data.feedToken,
     apiKey,
     clientcode,
-    expiresAt: Date.now() + 6 * 60 * 60 * 1000,
+    expiresAt: Date.now() + 5 * 60 * 60 * 1000,
   };
   return session;
 }
@@ -96,47 +86,109 @@ async function getInstrumentMaster() {
   }
   const res = await axios.get(INSTRUMENT_MASTER_URL, { timeout: 30000 });
   instrumentCache = { data: res.data, fetchedAt: Date.now() };
-  console.log('DEBUG instrument master total entries:', res.data.length);
   return res.data;
 }
 
-// TEST ENDPOINT: verifies login + shows sample NIFTY instrument entries
-app.get('/api/test', async (req, res) => {
+function parseExpiry(expiryStr) {
+  // Format: "11AUG2026"
+  const months = { JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11 };
+  const day = parseInt(expiryStr.slice(0, 2), 10);
+  const mon = months[expiryStr.slice(2, 5).toUpperCase()];
+  const year = parseInt(expiryStr.slice(5), 10);
+  return new Date(year, mon, day);
+}
+
+async function fetchQuotes(s, tokensByExchange) {
+  const res = await axios.post(
+    `${API_BASE}/rest/secure/angelbroking/market/v1/quote/`,
+    { mode: 'FULL', exchangeTokens: tokensByExchange },
+    { headers: authHeaders(s), timeout: 15000 }
+  );
+  return res.data;
+}
+
+app.get('/api/option-chain', async (req, res) => {
   try {
+    const range = parseInt(req.query.range) || 5; // strikes above/below ATM
     const s = await ensureSession();
     const instruments = await getInstrumentMaster();
 
-    // Find NIFTY option contracts (NFO segment)
-    const niftyOptions = instruments.filter(
+    // 1. Get spot price
+    const spotRes = await fetchQuotes(s, { NSE: [NIFTY_SPOT_TOKEN] });
+    console.log('DEBUG spotRes:', JSON.stringify(spotRes).slice(0, 500));
+    const spotData = spotRes.data.fetched.find((f) => f.symbolToken === NIFTY_SPOT_TOKEN);
+    const spot = spotData ? spotData.ltp : null;
+
+    if (!spot) {
+      return res.status(502).json({ error: 'Could not fetch NIFTY spot price', detail: spotRes });
+    }
+
+    // 2. Find NIFTY option contracts, nearest expiry
+    const allNiftyOptions = instruments.filter(
       (i) => i.name === 'NIFTY' && i.exch_seg === 'NFO' && i.instrumenttype === 'OPTIDX'
     );
-    console.log('DEBUG NIFTY option contracts found:', niftyOptions.length);
-    console.log('DEBUG sample NIFTY option entry:', JSON.stringify(niftyOptions[0]));
+    const today = new Date();
+    const expiries = [...new Set(allNiftyOptions.map((o) => o.expiry))]
+      .map((e) => ({ str: e, date: parseExpiry(e) }))
+      .filter((e) => e.date >= today)
+      .sort((a, b) => a.date - b.date);
+    const nearestExpiry = expiries[0].str;
 
-    // Find NIFTY spot index entry (case-insensitive, name can vary)
-    const niftySpot = instruments.find(
-      (i) => i.exch_seg === 'NSE' && /^nifty\s*50$/i.test((i.symbol || i.name || '').trim())
-    );
-    console.log('DEBUG NIFTY spot entry:', JSON.stringify(niftySpot));
+    const contractsThisExpiry = allNiftyOptions.filter((o) => o.expiry === nearestExpiry);
 
-    // Also show a few NSE entries containing "nifty" for debugging in case above fails
-    const nseNiftyLike = instruments.filter(
-      (i) => i.exch_seg === 'NSE' && /nifty/i.test(i.symbol || '') 
-    ).slice(0, 10);
+    // 3. Determine ATM and strike range
+    const step = 50;
+    const atm = Math.round(spot / step) * step;
+    const wantedStrikes = [];
+    for (let i = -range; i <= range; i++) wantedStrikes.push(atm + i * step);
+
+    const relevantContracts = contractsThisExpiry.filter((c) => {
+      const strikeVal = parseFloat(c.strike) / 100;
+      return wantedStrikes.includes(strikeVal);
+    });
+
+    const tokens = relevantContracts.map((c) => c.token);
+    // Angel One quote API allows max ~50 tokens per call typically; chunk if needed
+    const chunkSize = 50;
+    let allFetched = [];
+    for (let i = 0; i < tokens.length; i += chunkSize) {
+      const chunk = tokens.slice(i, i + chunkSize);
+      const qRes = await fetchQuotes(s, { NFO: chunk });
+      if (qRes.data && qRes.data.fetched) allFetched = allFetched.concat(qRes.data.fetched);
+    }
+
+    // 4. Build rows: for each strike, find CE and PE contract + quote
+    const rows = wantedStrikes.map((K) => {
+      const ceContract = relevantContracts.find((c) => parseFloat(c.strike) / 100 === K && c.symbol.endsWith('CE'));
+      const peContract = relevantContracts.find((c) => parseFloat(c.strike) / 100 === K && c.symbol.endsWith('PE'));
+      const ceQuote = ceContract ? allFetched.find((f) => f.symbolToken === ceContract.token) : null;
+      const peQuote = peContract ? allFetched.find((f) => f.symbolToken === peContract.token) : null;
+
+      return {
+        strike: K,
+        callOI: ceQuote ? ceQuote.opnInterest : 0,
+        callVol: ceQuote ? ceQuote.tradeVolume : 0,
+        callLTP: ceQuote ? ceQuote.ltp : 0,
+        callChange: ceQuote ? ceQuote.netChange : 0,
+        putOI: peQuote ? peQuote.opnInterest : 0,
+        putVol: peQuote ? peQuote.tradeVolume : 0,
+        putLTP: peQuote ? peQuote.ltp : 0,
+        putChange: peQuote ? peQuote.netChange : 0,
+      };
+    });
 
     res.json({
-      status: 'login successful',
-      totalInstruments: instruments.length,
-      niftyOptionCount: niftyOptions.length,
-      sampleNiftyOption: niftyOptions[0] || null,
-      sampleNiftySpot: niftySpot || null,
-      nseNiftyLikeEntries: nseNiftyLike,
-      first5NiftyOptions: niftyOptions.slice(0, 5),
+      symbol: 'NIFTY',
+      spot,
+      expiry: nearestExpiry,
+      atm,
+      timestamp: new Date().toISOString(),
+      rows,
     });
   } catch (err) {
-    console.error('Angel One API test failed:', err.response ? JSON.stringify(err.response.data) : err.message);
+    console.error('Option chain fetch failed:', err.response ? JSON.stringify(err.response.data) : err.message);
     res.status(502).json({
-      error: 'Angel One API call failed',
+      error: 'Failed to fetch option chain',
       detail: err.response ? err.response.data : err.message,
     });
   }
