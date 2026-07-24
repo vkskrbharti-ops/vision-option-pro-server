@@ -113,11 +113,16 @@ app.get('/api/test', async (req, res) => {
     console.log('DEBUG NIFTY option contracts found:', niftyOptions.length);
     console.log('DEBUG sample NIFTY option entry:', JSON.stringify(niftyOptions[0]));
 
-    // Find NIFTY spot index entry
+    // Find NIFTY spot index entry (case-insensitive, name can vary)
     const niftySpot = instruments.find(
-      (i) => (i.symbol === 'NIFTY 50' || i.name === 'NIFTY 50') && i.exch_seg === 'NSE'
+      (i) => i.exch_seg === 'NSE' && /^nifty\s*50$/i.test((i.symbol || i.name || '').trim())
     );
     console.log('DEBUG NIFTY spot entry:', JSON.stringify(niftySpot));
+
+    // Also show a few NSE entries containing "nifty" for debugging in case above fails
+    const nseNiftyLike = instruments.filter(
+      (i) => i.exch_seg === 'NSE' && /nifty/i.test(i.symbol || '') 
+    ).slice(0, 10);
 
     res.json({
       status: 'login successful',
@@ -125,6 +130,7 @@ app.get('/api/test', async (req, res) => {
       niftyOptionCount: niftyOptions.length,
       sampleNiftyOption: niftyOptions[0] || null,
       sampleNiftySpot: niftySpot || null,
+      nseNiftyLikeEntries: nseNiftyLike,
       first5NiftyOptions: niftyOptions.slice(0, 5),
     });
   } catch (err) {
